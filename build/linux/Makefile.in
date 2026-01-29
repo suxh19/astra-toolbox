@@ -259,8 +259,10 @@ CUDA_CXX_OBJECTS=\
 	src/CudaEMAlgorithm.lo \
 	src/CudaFDKAlgorithm3D.lo \
 	src/CudaSirtAlgorithm3D.lo \
+	src/CudaSirtAlgorithm3DBatch.lo \
 	src/CudaBackProjectionAlgorithm3D.lo \
-	src/CudaForwardProjectionAlgorithm3D.lo
+	src/CudaForwardProjectionAlgorithm3D.lo \
+	src/CudaForwardProjectionAlgorithm3DBatch.lo
 
 CUDA_OBJECTS=\
 	cuda/2d/algo.lo \

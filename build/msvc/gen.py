@@ -292,6 +292,7 @@ P_astra["filters"]["CUDA\\astra source"] = [
 "src\\CudaFilteredBackProjectionAlgorithm.cpp",
 "src\\CudaForwardProjectionAlgorithm.cpp",
 "src\\CudaForwardProjectionAlgorithm3D.cpp",
+"src\\CudaForwardProjectionAlgorithm3DBatch.cpp",
 "src\\CudaProjector2D.cpp",
 "src\\CudaProjector3D.cpp",
 "src\\CudaReconstructionAlgorithm2D.cpp",
@@ -299,6 +300,7 @@ P_astra["filters"]["CUDA\\astra source"] = [
 "src\\CudaSartAlgorithm.cpp",
 "src\\CudaSirtAlgorithm.cpp",
 "src\\CudaSirtAlgorithm3D.cpp",
+"src\\CudaSirtAlgorithm3DBatch.cpp",
 ]
 P_astra["filters"]["CUDA\\cuda headers"] = [
 "4e17872e-db7d-41bc-9760-fad1c253b583",
@@ -431,6 +433,7 @@ P_astra["filters"]["CUDA\\astra headers"] = [
 "include\\astra\\CudaFilteredBackProjectionAlgorithm.h",
 "include\\astra\\CudaForwardProjectionAlgorithm.h",
 "include\\astra\\CudaForwardProjectionAlgorithm3D.h",
+"include\\astra\\CudaForwardProjectionAlgorithm3DBatch.h",
 "include\\astra\\CudaProjector2D.h",
 "include\\astra\\CudaProjector3D.h",
 "include\\astra\\CudaReconstructionAlgorithm2D.h",
@@ -438,6 +441,7 @@ P_astra["filters"]["CUDA\\astra headers"] = [
 "include\\astra\\CudaSartAlgorithm.h",
 "include\\astra\\CudaSirtAlgorithm.h",
 "include\\astra\\CudaSirtAlgorithm3D.h",
+"include\\astra\\CudaSirtAlgorithm3DBatch.h",
 ]
 P_astra["filters"]["Projectors\\inline"] = [
 "0daffd63-ba49-4a5f-8d7a-5322e0e74f22",
