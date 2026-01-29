@@ -105,6 +105,53 @@ def _fp_batch(vol_ids: list[int], sino_ids: list[int]) -> tuple[float, float, fl
     return t_create, t_run, t_delete
 
 
+def _fp_baseline_keep_alive(vol_ids: list[int], sino_ids: list[int], repeats: int) -> tuple[float, float, float]:
+    alg_ids: list[int] = []
+    t0 = time.perf_counter()
+    for vid, sid in zip(vol_ids, sino_ids, strict=True):
+        cfg = astra.astra_dict("FP3D_CUDA")
+        cfg["VolumeDataId"] = vid
+        cfg["ProjectionDataId"] = sid
+        alg_ids.append(astra.algorithm.create(cfg))
+    t_create = time.perf_counter() - t0
+
+    run_times: list[float] = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        for aid in alg_ids:
+            astra.algorithm.run(aid)
+        run_times.append(time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    for aid in alg_ids:
+        astra.algorithm.delete(aid)
+    t_delete = time.perf_counter() - t0
+
+    return t_create, _median(run_times), t_delete
+
+
+def _fp_batch_keep_alive(vol_ids: list[int], sino_ids: list[int], repeats: int) -> tuple[float, float, float]:
+    cfg = astra.astra_dict("FP3D_CUDA_BATCH")
+    cfg["VolumeDataIds"] = vol_ids
+    cfg["ProjectionDataIds"] = sino_ids
+
+    t0 = time.perf_counter()
+    alg_id = astra.algorithm.create(cfg)
+    t_create = time.perf_counter() - t0
+
+    run_times: list[float] = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        astra.algorithm.run(alg_id)
+        run_times.append(time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    astra.algorithm.delete(alg_id)
+    t_delete = time.perf_counter() - t0
+
+    return t_create, _median(run_times), t_delete
+
+
 def _sirt_baseline(sino_ids: list[int], recon_ids: list[int], iters: int, relax: float) -> tuple[float, float, float]:
     t_create = 0.0
     t_run = 0.0
@@ -149,6 +196,73 @@ def _sirt_batch(sino_ids: list[int], recon_ids: list[int], iters: int, relax: fl
     t_delete = time.perf_counter() - t0
 
     return t_create, t_run, t_delete
+
+
+def _sirt_baseline_keep_alive(
+    sino_ids: list[int],
+    recon_ids: list[int],
+    recon_arrays: list[np.ndarray],
+    iters: int,
+    relax: float,
+    repeats: int,
+) -> tuple[float, float, float]:
+    alg_ids: list[int] = []
+    t0 = time.perf_counter()
+    for sid, rid in zip(sino_ids, recon_ids, strict=True):
+        cfg = astra.astra_dict("SIRT3D_CUDA")
+        cfg["ProjectionDataId"] = sid
+        cfg["ReconstructionDataId"] = rid
+        cfg["options"] = {"Relaxation": float(relax)}
+        alg_ids.append(astra.algorithm.create(cfg))
+    t_create = time.perf_counter() - t0
+
+    run_times: list[float] = []
+    for _ in range(repeats):
+        for r in recon_arrays:
+            r.fill(0.0)
+        t0 = time.perf_counter()
+        for aid in alg_ids:
+            astra.algorithm.run(aid, iters)
+        run_times.append(time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    for aid in alg_ids:
+        astra.algorithm.delete(aid)
+    t_delete = time.perf_counter() - t0
+
+    return t_create, _median(run_times), t_delete
+
+
+def _sirt_batch_keep_alive(
+    sino_ids: list[int],
+    recon_ids: list[int],
+    recon_arrays: list[np.ndarray],
+    iters: int,
+    relax: float,
+    repeats: int,
+) -> tuple[float, float, float]:
+    cfg = astra.astra_dict("SIRT3D_CUDA_BATCH")
+    cfg["ProjectionDataIds"] = sino_ids
+    cfg["ReconstructionDataIds"] = recon_ids
+    cfg["options"] = {"Relaxation": float(relax)}
+
+    t0 = time.perf_counter()
+    alg_id = astra.algorithm.create(cfg)
+    t_create = time.perf_counter() - t0
+
+    run_times: list[float] = []
+    for _ in range(repeats):
+        for r in recon_arrays:
+            r.fill(0.0)
+        t0 = time.perf_counter()
+        astra.algorithm.run(alg_id, iters)
+        run_times.append(time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    astra.algorithm.delete(alg_id)
+    t_delete = time.perf_counter() - t0
+
+    return t_create, _median(run_times), t_delete
 
 
 def _print_result(name: str, t_create: float, t_run: float, t_delete: float, bsz: int) -> None:
@@ -278,6 +392,15 @@ def main() -> int:
         speedup = (tcb + trb + tdb) / (tcc + trc + tdc)
         print(f"{'speedup':>22}  x{speedup:.2f}")
 
+        # FP keep-alive benchmark: amortize create/delete across repeats
+        tcb, trb, tdb = _fp_baseline_keep_alive(vol_ids, sino_ids0, args.repeats)
+        tcc, trc, tdc = _fp_batch_keep_alive(vol_ids, sino_ids1, args.repeats)
+        print("-- FP3D_CUDA (keep-alive) --")
+        _print_result("baseline (loop)", tcb, trb, tdb, bsz)
+        _print_result("batch (C++)", tcc, trc, tdc, bsz)
+        speedup = (tcb + trb + tdb) / (tcc + trc + tdc)
+        print(f"{'speedup':>22}  x{speedup:.2f}")
+
         # SIRT benchmark (use the sinograms from FP baseline to avoid random differences)
         sirt_base = []
         sirt_batch = []
@@ -298,6 +421,19 @@ def main() -> int:
         speedup = (tcb + trb + tdb) / (tcc + trc + tdc)
         print(f"{'speedup':>22}  x{speedup:.2f}")
 
+        # SIRT keep-alive benchmark: amortize init across repeats (still avoids Python loop overhead in batch)
+        tcb, trb, tdb = _sirt_baseline_keep_alive(
+            sino_ids0, recon_ids0, recons0, args.sirt_iters, args.relax, args.repeats
+        )
+        tcc, trc, tdc = _sirt_batch_keep_alive(
+            sino_ids0, recon_ids1, recons1, args.sirt_iters, args.relax, args.repeats
+        )
+        print("-- SIRT3D_CUDA (keep-alive) --")
+        _print_result("baseline (loop)", tcb, trb, tdb, bsz)
+        _print_result("batch (C++)", tcc, trc, tdc, bsz)
+        speedup = (tcb + trb + tdb) / (tcc + trc + tdc)
+        print(f"{'speedup':>22}  x{speedup:.2f}")
+
         astra.data3d.delete(vol_ids + sino_ids0 + sino_ids1 + recon_ids0 + recon_ids1)
 
         mem1 = _nvidia_smi_used_mem_mb(args.gpu)
@@ -310,4 +446,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

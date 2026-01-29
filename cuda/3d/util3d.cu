@@ -73,28 +73,21 @@ cudaPitchedPtr allocateProjectionData(const SDimensions3D& dims)
 }
 bool zeroVolumeData(cudaPitchedPtr& D_data, const SDimensions3D& dims)
 {
-	char* t = (char*)D_data.ptr;
+	cudaExtent extentV;
+	extentV.width = dims.iVolX*sizeof(float);
+	extentV.height = dims.iVolY;
+	extentV.depth = dims.iVolZ;
 
-	for (unsigned int z = 0; z < dims.iVolZ; ++z) {
-		if (!checkCuda(cudaMemset2D(t, D_data.pitch, 0, dims.iVolX*sizeof(float), dims.iVolY), "zeroVolumeData 3D")) {
-			return false;
-		}
-		t += D_data.pitch * dims.iVolY;
-	}
-	return true;
+	return checkCuda(cudaMemset3D(D_data, 0, extentV), "zeroVolumeData 3D");
 }
 bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims)
 {
-	char* t = (char*)D_data.ptr;
+	cudaExtent extentP;
+	extentP.width = dims.iProjU*sizeof(float);
+	extentP.height = dims.iProjAngles;
+	extentP.depth = dims.iProjV;
 
-	for (unsigned int z = 0; z < dims.iProjV; ++z) {
-		if (!checkCuda(cudaMemset2D(t, D_data.pitch, 0, dims.iProjU*sizeof(float), dims.iProjAngles), "zeroProjectionData 3D")) {
-			return false;
-		}
-		t += D_data.pitch * dims.iProjAngles;
-	}
-
-	return true;
+	return checkCuda(cudaMemset3D(D_data, 0, extentP), "zeroProjectionData 3D");
 }
 bool copyVolumeToDevice(const float* data, cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch)
 {

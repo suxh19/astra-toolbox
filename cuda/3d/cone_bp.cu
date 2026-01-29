@@ -32,6 +32,7 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 
 #include <cstdio>
 #include <cassert>
+#include <memory>
 
 namespace astraCUDA3d {
 
@@ -301,6 +302,159 @@ bool transferConstants(const SConeProjection* angles, unsigned int iProjAngles, 
 	return ok;
 }
 
+namespace {
+
+static bool ConeBP_Array_internal(cudaPitchedPtr D_volumeData,
+                                 cudaTextureObject_t tex,
+                                 const SDimensions3D& dims, const SConeProjection* angles,
+                                 const SProjectorParams3D& params,
+                                 TransferConstantsBuffer& tcbuf,
+                                 cudaStream_t stream,
+                                 bool skipConstantsUpload)
+{
+	float fOutputScale;
+	if (params.projKernel == ker3d_fdk_weighting) {
+		// NB: assuming cube voxels here
+		fOutputScale = params.fOutputScale / (params.volScale.fX);
+	} else {
+		fOutputScale = params.fOutputScale * (params.volScale.fX * params.volScale.fY * params.volScale.fZ);
+	}
+
+	bool ok = true;
+
+	const SConeProjection* anglePtr = angles;
+
+	for (unsigned int th = 0; th < dims.iProjAngles; th += g_MaxAngles) {
+		unsigned int angleCount = g_MaxAngles;
+		if (th + angleCount > dims.iProjAngles)
+			angleCount = dims.iProjAngles - th;
+
+		// The constant memory transfer is fairly small, but when iterating many
+		// times on a fixed geometry it can be skipped.
+		if (!(skipConstantsUpload && th == 0)) {
+			ok = transferConstants(anglePtr, angleCount, params, tcbuf, stream);
+			if (!ok)
+				break;
+		}
+
+		dim3 dimBlock(g_volBlockX, g_volBlockY);
+
+		dim3 dimGrid(((dims.iVolX/1+g_volBlockX-1)/(g_volBlockX))*((dims.iVolY/1+1*g_volBlockY-1)/(1*g_volBlockY)), (dims.iVolZ+g_volBlockZ-1)/g_volBlockZ);
+
+		for (unsigned int i = 0; i < angleCount; i += g_anglesPerBlock) {
+			if (params.projKernel == ker3d_fdk_weighting) {
+				if (dims.iVolZ == 1) {
+					dev_cone_BP<ker3d_fdk_weighting, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, fOutputScale);
+				} else {
+					dev_cone_BP<ker3d_fdk_weighting, g_volBlockZ><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, fOutputScale);
+				}
+			} else if (params.projKernel == ker3d_2d_weighting) {
+				dev_cone_BP<ker3d_2d_weighting, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, fOutputScale);
+			} else if (params.iRaysPerVoxelDim == 1) {
+				if (dims.iVolZ == 1) {
+					dev_cone_BP<ker3d_default, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, fOutputScale);
+				} else {
+					dev_cone_BP<ker3d_default, g_volBlockZ><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, fOutputScale);
+				}
+			} else {
+				dev_cone_BP_SS<<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), tex, i, th, dims, params.iRaysPerVoxelDim, fOutputScale);
+			}
+		}
+
+		anglePtr += angleCount;
+	}
+
+	return ok;
+}
+
+struct ConeBPContext {
+	int device = -1;
+	unsigned int projU = 0;
+	unsigned int projAngles = 0;
+	unsigned int projV = 0;
+
+	cudaStream_t stream = 0;
+	cudaArray* projArray = nullptr;
+	cudaTextureObject_t texObj = 0;
+	std::unique_ptr<TransferConstantsBuffer> tcbuf;
+
+	// Optional caching to avoid re-uploading constant memory when geometry is unchanged.
+	const SConeProjection* lastAngles = nullptr;
+	unsigned int lastAngleCount = 0;
+	Cuda3DProjectionKernel lastKernel = ker3d_default;
+	SVolScale3D lastVolScale;
+
+	~ConeBPContext() { release(); }
+
+	void release()
+	{
+		if (texObj) {
+			cudaDestroyTextureObject(texObj);
+			texObj = 0;
+		}
+		if (projArray) {
+			cudaFreeArray(projArray);
+			projArray = nullptr;
+		}
+		if (stream) {
+			cudaStreamDestroy(stream);
+			stream = 0;
+		}
+
+		device = -1;
+		projU = projAngles = projV = 0;
+		lastAngles = nullptr;
+		lastAngleCount = 0;
+		lastKernel = ker3d_default;
+		lastVolScale = SVolScale3D{};
+	}
+
+	bool ensure(int currentDevice, const SDimensions3D& dims)
+	{
+		if (device != currentDevice) {
+			release();
+			device = currentDevice;
+		}
+
+		if (!stream) {
+			if (!checkCuda(cudaStreamCreate(&stream), "ConeBP cache stream"))
+				return false;
+		}
+
+		if (!tcbuf)
+			tcbuf = std::make_unique<TransferConstantsBuffer>(g_MaxAngles);
+
+		if (!projArray || projU != dims.iProjU || projAngles != dims.iProjAngles || projV != dims.iProjV) {
+			if (texObj) {
+				cudaDestroyTextureObject(texObj);
+				texObj = 0;
+			}
+			if (projArray) {
+				cudaFreeArray(projArray);
+				projArray = nullptr;
+			}
+
+			projArray = allocateProjectionArray(dims);
+			if (!projArray)
+				return false;
+
+			if (!createTextureObject3D(projArray, texObj)) {
+				cudaFreeArray(projArray);
+				projArray = nullptr;
+				return false;
+			}
+
+			projU = dims.iProjU;
+			projAngles = dims.iProjAngles;
+			projV = dims.iProjV;
+		}
+
+		return true;
+	}
+};
+
+} // namespace
+
 
 bool ConeBP_Array(cudaPitchedPtr D_volumeData,
                   cudaArray *D_projArray,
@@ -319,57 +473,9 @@ bool ConeBP_Array(cudaPitchedPtr D_volumeData,
 		return false;
 	}
 
-	float fOutputScale;
-	if (params.projKernel == ker3d_fdk_weighting) {
-		// NB: assuming cube voxels here
-		fOutputScale = params.fOutputScale / (params.volScale.fX);
-	} else {
-		fOutputScale = params.fOutputScale * (params.volScale.fX * params.volScale.fY * params.volScale.fZ);
-	}
+	bool ok = ConeBP_Array_internal(D_volumeData, D_texObj, dims, angles, params, tcbuf, stream, false);
 
-	bool ok = true;
-
-	for (unsigned int th = 0; th < dims.iProjAngles; th += g_MaxAngles) {
-		unsigned int angleCount = g_MaxAngles;
-		if (th + angleCount > dims.iProjAngles)
-			angleCount = dims.iProjAngles - th;
-
-		ok = transferConstants(angles, angleCount, params, tcbuf, stream);
-		if (!ok)
-			break;
-
-		dim3 dimBlock(g_volBlockX, g_volBlockY);
-
-		dim3 dimGrid(((dims.iVolX/1+g_volBlockX-1)/(g_volBlockX))*((dims.iVolY/1+1*g_volBlockY-1)/(1*g_volBlockY)), (dims.iVolZ+g_volBlockZ-1)/g_volBlockZ);
-
-		// timeval t;
-		// tic(t);
-
-		for (unsigned int i = 0; i < angleCount; i += g_anglesPerBlock) {
-		// printf("Calling BP: %d, %dx%d, %dx%d to %p\n", i, dimBlock.x, dimBlock.y, dimGrid.x, dimGrid.y, (void*)D_volumeData.ptr); 
-			if (params.projKernel == ker3d_fdk_weighting) {
-				if (dims.iVolZ == 1) {
-					dev_cone_BP<ker3d_fdk_weighting, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, fOutputScale);
-				} else {
-					dev_cone_BP<ker3d_fdk_weighting, g_volBlockZ><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, fOutputScale);
-				}
-			} else if (params.projKernel == ker3d_2d_weighting) {
-				dev_cone_BP<ker3d_2d_weighting, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, fOutputScale);
-			} else if (params.iRaysPerVoxelDim == 1) {
-				if (dims.iVolZ == 1) {
-					dev_cone_BP<ker3d_default, 1><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, fOutputScale);
-				} else {
-					dev_cone_BP<ker3d_default, g_volBlockZ><<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, fOutputScale);
-				}
-			} else
-				dev_cone_BP_SS<<<dimGrid, dimBlock, 0, stream>>>(D_volumeData.ptr, D_volumeData.pitch/sizeof(float), D_texObj, i, th, dims, params.iRaysPerVoxelDim, fOutputScale);
-		}
-
-		angles = angles + angleCount;
-		// printf("%f\n", toc(t));
-	}
-
-	ok = checkCuda(cudaStreamSynchronize(stream), "ConeBP sync");
+	ok &= checkCuda(cudaStreamSynchronize(stream), "ConeBP sync");
 
 	cudaDestroyTextureObject(D_texObj);
 	cudaStreamDestroy(stream);
@@ -382,22 +488,38 @@ bool ConeBP(cudaPitchedPtr D_volumeData,
             const SDimensions3D& dims, const SConeProjection* angles,
             const SProjectorParams3D& params)
 {
-	// transfer projections to array
+	thread_local ConeBPContext cache;
 
-	cudaArray* cuArray = allocateProjectionArray(dims);
-	if (!cuArray)
+	int dev;
+	if (!checkCuda(cudaGetDevice(&dev), "ConeBP getDevice"))
 		return false;
-	
-	if (!transferProjectionsToArray(D_projData, cuArray, dims)) {
-		cudaFreeArray(cuArray);
+
+	if (!cache.ensure(dev, dims))
 		return false;
+
+	// transfer projections to array on the same stream we use for kernels
+	if (!transferProjectionsToArray(D_projData, cache.projArray, dims, cache.stream))
+		return false;
+
+	const bool canCacheConstants = dims.iProjAngles <= g_MaxAngles;
+	const bool sameConstants =
+	    canCacheConstants && cache.lastAngles == angles && cache.lastAngleCount == dims.iProjAngles
+	    && cache.lastKernel == params.projKernel
+	    && cache.lastVolScale.fX == params.volScale.fX
+	    && cache.lastVolScale.fY == params.volScale.fY
+	    && cache.lastVolScale.fZ == params.volScale.fZ;
+
+	bool ok = ConeBP_Array_internal(D_volumeData, cache.texObj, dims, angles, params, *cache.tcbuf, cache.stream, sameConstants);
+
+	if (ok && canCacheConstants && !sameConstants) {
+		cache.lastAngles = angles;
+		cache.lastAngleCount = dims.iProjAngles;
+		cache.lastKernel = params.projKernel;
+		cache.lastVolScale = params.volScale;
 	}
 
-	bool ret = ConeBP_Array(D_volumeData, cuArray, dims, angles, params);
-
-	cudaFreeArray(cuArray);
-
-	return ret;
+	ok &= checkCuda(cudaStreamSynchronize(cache.stream), "ConeBP sync");
+	return ok;
 }
 
 
