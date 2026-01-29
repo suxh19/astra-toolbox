@@ -32,7 +32,9 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 
 #include <cstdio>
 #include <cassert>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 namespace astraCUDA3d {
 
@@ -159,7 +161,7 @@ struct ConeFPContext {
 	std::unique_ptr<TransferConstantsBuffer> tcbuf;
 
 	// Optional caching to avoid re-uploading constant memory when geometry is unchanged.
-	const SConeProjection* lastAngles = nullptr;
+	std::vector<SConeProjection> lastAnglesCopy;
 	unsigned int lastAngleCount = 0;
 
 	~ConeFPContext() { release(); }
@@ -181,7 +183,7 @@ struct ConeFPContext {
 
 		device = -1;
 		volX = volY = volZ = 0;
-		lastAngles = nullptr;
+		lastAnglesCopy.clear();
 		lastAngleCount = 0;
 	}
 
@@ -549,8 +551,13 @@ bool ConeFP(cudaPitchedPtr D_volumeData,
 	bool ok = true;
 
 	const bool canCacheAngles = dims.iProjAngles <= g_MaxAngles;
-	const bool needAnglesUpload =
-	    !canCacheAngles || cache.lastAngles != angles || cache.lastAngleCount != dims.iProjAngles;
+	bool sameAngles = false;
+	if (canCacheAngles && cache.lastAngleCount == dims.iProjAngles &&
+	    cache.lastAnglesCopy.size() == dims.iProjAngles) {
+		sameAngles = std::memcmp(cache.lastAnglesCopy.data(), angles,
+		                         dims.iProjAngles * sizeof(SConeProjection)) == 0;
+	}
+	const bool needAnglesUpload = !canCacheAngles || !sameAngles;
 
 	for (unsigned int iAngle = 0; iAngle < dims.iProjAngles; iAngle += g_MaxAngles) {
 		unsigned int iEndAngle = iAngle + g_MaxAngles;
@@ -576,7 +583,7 @@ bool ConeFP(cudaPitchedPtr D_volumeData,
 	}
 
 	if (ok && canCacheAngles && needAnglesUpload) {
-		cache.lastAngles = angles;
+		cache.lastAnglesCopy.assign(angles, angles + dims.iProjAngles);
 		cache.lastAngleCount = dims.iProjAngles;
 	}
 

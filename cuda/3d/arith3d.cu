@@ -144,69 +144,81 @@ __global__ void devFtoD(float* pfOut, float fParam, unsigned int pitch, unsigned
 
 
 template<class op, unsigned int repeat>
-__global__ void devDtoD(float* pfOut, const float* pfIn, unsigned int pitch, unsigned int width, unsigned int height)
+__global__ void devDtoD(float* pfOut, unsigned int outPitch, const float* pfIn, unsigned int inPitch, unsigned int width, unsigned int height)
 {
 	unsigned int x = threadIdx.x + 16*blockIdx.x;
 	if (x >= width) return;
 
 	unsigned int y = (threadIdx.y + 16*blockIdx.y)*repeat;
-	unsigned int off = y*pitch+x;
+	unsigned int offOut = y*outPitch+x;
+	unsigned int offIn = y*inPitch+x;
 	for (unsigned int i = 0; i < repeat; ++i) {
 		if (y >= height)
 			break;
-		op()(pfOut[off], pfIn[off]);
-		off += pitch;
+		op()(pfOut[offOut], pfIn[offIn]);
+		offOut += outPitch;
+		offIn += inPitch;
 		y++;
 	}
 }
 
 template<class op, unsigned int repeat>
-__global__ void devDFtoD(float* pfOut, const float* pfIn, float fParam, unsigned int pitch, unsigned int width, unsigned int height)
+__global__ void devDFtoD(float* pfOut, unsigned int outPitch, const float* pfIn, unsigned int inPitch, float fParam, unsigned int width, unsigned int height)
 {
 	unsigned int x = threadIdx.x + 16*blockIdx.x;
 	if (x >= width) return;
 
 	unsigned int y = (threadIdx.y + 16*blockIdx.y)*repeat;
-	unsigned int off = y*pitch+x;
+	unsigned int offOut = y*outPitch+x;
+	unsigned int offIn = y*inPitch+x;
 	for (unsigned int i = 0; i < repeat; ++i) {
 		if (y >= height)
 			break;
-		op()(pfOut[off], pfIn[off], fParam);
-		off += pitch;
+		op()(pfOut[offOut], pfIn[offIn], fParam);
+		offOut += outPitch;
+		offIn += inPitch;
 		y++;
 	}
 }
 
 template<class op, unsigned int repeat>
-__global__ void devDDtoD(float* pfOut, const float* pfIn1, const float* pfIn2, unsigned int pitch, unsigned int width, unsigned int height)
+__global__ void devDDtoD(float* pfOut, unsigned int outPitch, const float* pfIn1, unsigned int in1Pitch, const float* pfIn2, unsigned int in2Pitch, unsigned int width, unsigned int height)
 {
 	unsigned int x = threadIdx.x + 16*blockIdx.x;
 	if (x >= width) return;
 
 	unsigned int y = (threadIdx.y + 16*blockIdx.y)*repeat;
-	unsigned int off = y*pitch+x;
+	unsigned int offOut = y*outPitch+x;
+	unsigned int offIn1 = y*in1Pitch+x;
+	unsigned int offIn2 = y*in2Pitch+x;
 	for (unsigned int i = 0; i < repeat; ++i) {
 		if (y >= height)
 			break;
-		op()(pfOut[off], pfIn1[off], pfIn2[off]);
-		off += pitch;
+		op()(pfOut[offOut], pfIn1[offIn1], pfIn2[offIn2]);
+		offOut += outPitch;
+		offIn1 += in1Pitch;
+		offIn2 += in2Pitch;
 		y++;
 	}
 }
 
 template<class op, unsigned int repeat>
-__global__ void devDDFtoD(float* pfOut, const float* pfIn1, const float* pfIn2, float fParam, unsigned int pitch, unsigned int width, unsigned int height)
+__global__ void devDDFtoD(float* pfOut, unsigned int outPitch, const float* pfIn1, unsigned int in1Pitch, const float* pfIn2, unsigned int in2Pitch, float fParam, unsigned int width, unsigned int height)
 {
 	unsigned int x = threadIdx.x + 16*blockIdx.x;
 	if (x >= width) return;
 
 	unsigned int y = (threadIdx.y + 16*blockIdx.y)*repeat;
-	unsigned int off = y*pitch+x;
+	unsigned int offOut = y*outPitch+x;
+	unsigned int offIn1 = y*in1Pitch+x;
+	unsigned int offIn2 = y*in2Pitch+x;
 	for (unsigned int i = 0; i < repeat; ++i) {
 		if (y >= height)
 			break;
-		op()(pfOut[off], pfIn1[off], pfIn2[off], fParam);
-		off += pitch;
+		op()(pfOut[offOut], pfIn1[offIn1], pfIn2[offIn2], fParam);
+		offOut += outPitch;
+		offIn1 += in1Pitch;
+		offIn2 += in2Pitch;
 		y++;
 	}
 }
@@ -270,12 +282,15 @@ bool processVol3D(cudaPitchedPtr& out, const cudaPitchedPtr& in, const SDimensio
 	dim3 gridSize((dims.iVolX+15)/16, (dims.iVolY+511)/512);
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn = (const float*)in.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iVolY;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int inPitch = in.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iVolY;
+	const unsigned int inStep = inPitch * dims.iVolY;
 
 	for (unsigned int i = 0; i < dims.iVolZ; ++i) {
-		devDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn, out.pitch/sizeof(float), dims.iVolX, dims.iVolY);
-		pfOut += step;
-		pfIn += step;
+		devDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn, inPitch, dims.iVolX, dims.iVolY);
+		pfOut += outStep;
+		pfIn += inStep;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -292,12 +307,15 @@ bool processVol3D(cudaPitchedPtr& out, const cudaPitchedPtr& in, float fParam, c
 	dim3 gridSize((dims.iVolX+15)/16, (dims.iVolY+511)/512);
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn = (const float*)in.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iVolY;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int inPitch = in.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iVolY;
+	const unsigned int inStep = inPitch * dims.iVolY;
 
 	for (unsigned int i = 0; i < dims.iVolZ; ++i) {
-		devDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn, fParam, out.pitch/sizeof(float), dims.iVolX, dims.iVolY);
-		pfOut += step;
-		pfIn += step;
+		devDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn, inPitch, fParam, dims.iVolX, dims.iVolY);
+		pfOut += outStep;
+		pfIn += inStep;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -315,13 +333,18 @@ bool processVol3D(cudaPitchedPtr& out, const cudaPitchedPtr& in1, const cudaPitc
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn1 = (const float*)in1.ptr;
 	const float *pfIn2 = (const float*)in2.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iVolY;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int in1Pitch = in1.pitch / sizeof(float);
+	const unsigned int in2Pitch = in2.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iVolY;
+	const unsigned int in1Step = in1Pitch * dims.iVolY;
+	const unsigned int in2Step = in2Pitch * dims.iVolY;
 
 	for (unsigned int i = 0; i < dims.iVolZ; ++i) {
-		devDDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn1, pfIn2, fParam, out.pitch/sizeof(float), dims.iVolX, dims.iVolY);
-		pfOut += step;
-		pfIn1 += step;
-		pfIn2 += step;
+		devDDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn1, in1Pitch, pfIn2, in2Pitch, fParam, dims.iVolX, dims.iVolY);
+		pfOut += outStep;
+		pfIn1 += in1Step;
+		pfIn2 += in2Step;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -339,13 +362,18 @@ bool processVol3D(cudaPitchedPtr& out, const cudaPitchedPtr& in1, const cudaPitc
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn1 = (const float*)in1.ptr;
 	const float *pfIn2 = (const float*)in2.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iVolY;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int in1Pitch = in1.pitch / sizeof(float);
+	const unsigned int in2Pitch = in2.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iVolY;
+	const unsigned int in1Step = in1Pitch * dims.iVolY;
+	const unsigned int in2Step = in2Pitch * dims.iVolY;
 
 	for (unsigned int i = 0; i < dims.iVolZ; ++i) {
-		devDDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn1, pfIn2, out.pitch/sizeof(float), dims.iVolX, dims.iVolY);
-		pfOut += step;
-		pfIn1 += step;
-		pfIn2 += step;
+		devDDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn1, in1Pitch, pfIn2, in2Pitch, dims.iVolX, dims.iVolY);
+		pfOut += outStep;
+		pfIn1 += in1Step;
+		pfIn2 += in2Step;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -414,12 +442,15 @@ bool processSino3D(cudaPitchedPtr& out, const cudaPitchedPtr& in, const SDimensi
 	dim3 gridSize((dims.iProjU+15)/16, (dims.iProjAngles+511)/512);
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn = (const float*)in.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iProjAngles;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int inPitch = in.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iProjAngles;
+	const unsigned int inStep = inPitch * dims.iProjAngles;
 
 	for (unsigned int i = 0; i < dims.iProjV; ++i) {
-		devDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn, out.pitch/sizeof(float), dims.iProjU, dims.iProjAngles);
-		pfOut += step;
-		pfIn += step;
+		devDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn, inPitch, dims.iProjU, dims.iProjAngles);
+		pfOut += outStep;
+		pfIn += inStep;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -436,12 +467,15 @@ bool processSino3D(cudaPitchedPtr& out, const cudaPitchedPtr& in, float fParam, 
 	dim3 gridSize((dims.iProjU+15)/16, (dims.iProjAngles+511)/512);
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn = (const float*)in.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iProjAngles;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int inPitch = in.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iProjAngles;
+	const unsigned int inStep = inPitch * dims.iProjAngles;
 
 	for (unsigned int i = 0; i < dims.iProjV; ++i) {
-		devDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn, fParam, out.pitch/sizeof(float), dims.iProjU, dims.iProjAngles);
-		pfOut += step;
-		pfIn += step;
+		devDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn, inPitch, fParam, dims.iProjU, dims.iProjAngles);
+		pfOut += outStep;
+		pfIn += inStep;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -459,13 +493,18 @@ bool processSino3D(cudaPitchedPtr& out, const cudaPitchedPtr& in1, const cudaPit
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn1 = (const float*)in1.ptr;
 	const float *pfIn2 = (const float*)in2.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iProjAngles;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int in1Pitch = in1.pitch / sizeof(float);
+	const unsigned int in2Pitch = in2.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iProjAngles;
+	const unsigned int in1Step = in1Pitch * dims.iProjAngles;
+	const unsigned int in2Step = in2Pitch * dims.iProjAngles;
 
 	for (unsigned int i = 0; i < dims.iProjV; ++i) {
-		devDDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn1, pfIn2, fParam, out.pitch/sizeof(float), dims.iProjU, dims.iProjAngles);
-		pfOut += step;
-		pfIn1 += step;
-		pfIn2 += step;
+		devDDFtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn1, in1Pitch, pfIn2, in2Pitch, fParam, dims.iProjU, dims.iProjAngles);
+		pfOut += outStep;
+		pfIn1 += in1Step;
+		pfIn2 += in2Step;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);
@@ -483,13 +522,18 @@ bool processSino3D(cudaPitchedPtr& out, const cudaPitchedPtr& in1, const cudaPit
 	float *pfOut = (float*)out.ptr;
 	const float *pfIn1 = (const float*)in1.ptr;
 	const float *pfIn2 = (const float*)in2.ptr;
-	unsigned int step = out.pitch/sizeof(float) * dims.iProjAngles;
+	const unsigned int outPitch = out.pitch / sizeof(float);
+	const unsigned int in1Pitch = in1.pitch / sizeof(float);
+	const unsigned int in2Pitch = in2.pitch / sizeof(float);
+	const unsigned int outStep = outPitch * dims.iProjAngles;
+	const unsigned int in1Step = in1Pitch * dims.iProjAngles;
+	const unsigned int in2Step = in2Pitch * dims.iProjAngles;
 
 	for (unsigned int i = 0; i < dims.iProjV; ++i) {
-		devDDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, pfIn1, pfIn2, out.pitch/sizeof(float), dims.iProjU, dims.iProjAngles);
-		pfOut += step;
-		pfIn1 += step;
-		pfIn2 += step;
+		devDDtoD<op, 32><<<gridSize, blockSize, 0, stream()>>>(pfOut, outPitch, pfIn1, in1Pitch, pfIn2, in2Pitch, dims.iProjU, dims.iProjAngles);
+		pfOut += outStep;
+		pfIn1 += in1Step;
+		pfIn2 += in2Step;
 	}
 
 	return stream.syncIfSync(__FUNCTION__);

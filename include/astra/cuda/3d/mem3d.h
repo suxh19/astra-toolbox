@@ -31,6 +31,7 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 #include "astra3d.h"
 
 #include <memory>
+#include <cstddef>
 
 namespace astra {
 class CVolumeGeometry3D;
@@ -62,6 +63,18 @@ struct MemHandle3D {
 	std::shared_ptr<SMemHandle3D_internal> d;
 	operator bool() const { return (bool)d; }
 };
+
+// Opaque accessors for CUDA pitched pointers stored inside MemHandle3D.
+// This is useful for GPU algorithms that work directly on external GPU data
+// (e.g. DLPack/GPULink) without copying to host.
+struct MemPitchedPtrInfo3D {
+	void* ptr = nullptr;
+	size_t pitch = 0;
+	size_t xsize = 0;
+	size_t ysize = 0;
+};
+
+_AstraExport bool getPitchedPtrInfo(const MemHandle3D& handle, MemPitchedPtrInfo3D& out);
 
 struct SSubDimensions3D {
 	unsigned int nx;

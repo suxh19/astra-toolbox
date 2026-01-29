@@ -32,7 +32,9 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 
 #include <cstdio>
 #include <cassert>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 namespace astraCUDA3d {
 
@@ -379,7 +381,7 @@ struct ConeBPContext {
 	std::unique_ptr<TransferConstantsBuffer> tcbuf;
 
 	// Optional caching to avoid re-uploading constant memory when geometry is unchanged.
-	const SConeProjection* lastAngles = nullptr;
+	std::vector<SConeProjection> lastAnglesCopy;
 	unsigned int lastAngleCount = 0;
 	Cuda3DProjectionKernel lastKernel = ker3d_default;
 	SVolScale3D lastVolScale;
@@ -403,7 +405,7 @@ struct ConeBPContext {
 
 		device = -1;
 		projU = projAngles = projV = 0;
-		lastAngles = nullptr;
+		lastAnglesCopy.clear();
 		lastAngleCount = 0;
 		lastKernel = ker3d_default;
 		lastVolScale = SVolScale3D{};
@@ -502,8 +504,14 @@ bool ConeBP(cudaPitchedPtr D_volumeData,
 		return false;
 
 	const bool canCacheConstants = dims.iProjAngles <= g_MaxAngles;
+	bool sameAngles = false;
+	if (canCacheConstants && cache.lastAngleCount == dims.iProjAngles &&
+	    cache.lastAnglesCopy.size() == dims.iProjAngles) {
+		sameAngles = std::memcmp(cache.lastAnglesCopy.data(), angles,
+		                         dims.iProjAngles * sizeof(SConeProjection)) == 0;
+	}
 	const bool sameConstants =
-	    canCacheConstants && cache.lastAngles == angles && cache.lastAngleCount == dims.iProjAngles
+	    canCacheConstants && sameAngles
 	    && cache.lastKernel == params.projKernel
 	    && cache.lastVolScale.fX == params.volScale.fX
 	    && cache.lastVolScale.fY == params.volScale.fY
@@ -512,7 +520,7 @@ bool ConeBP(cudaPitchedPtr D_volumeData,
 	bool ok = ConeBP_Array_internal(D_volumeData, cache.texObj, dims, angles, params, *cache.tcbuf, cache.stream, sameConstants);
 
 	if (ok && canCacheConstants && !sameConstants) {
-		cache.lastAngles = angles;
+		cache.lastAnglesCopy.assign(angles, angles + dims.iProjAngles);
 		cache.lastAngleCount = dims.iProjAngles;
 		cache.lastKernel = params.projKernel;
 		cache.lastVolScale = params.volScale;

@@ -78,26 +78,58 @@ float dotProduct2D(float* D_data, unsigned int pitch,
                    std::optional<cudaStream_t> _stream = {});
 
 
+// When no stream is provided, many helper functions used to create/destroy a
+// temporary CUDA stream for every call. That overhead becomes significant in
+// iterative 3D algorithms (e.g. SIRT/CGLS) that call these helpers frequently.
+// We therefore keep a per-thread cached stream and synchronize it at the end
+// of each helper call to preserve the original synchronous semantics.
+struct CachedStream {
+	int device = -1;
+	cudaStream_t stream = 0;
+
+	bool ensure() {
+		int dev = 0;
+		if (!checkCuda(cudaGetDevice(&dev), "StreamHelper getDevice"))
+			return false;
+
+		if (device != dev || !stream) {
+			if (stream) {
+				cudaStreamDestroy(stream);
+				stream = 0;
+			}
+			device = dev;
+			return checkCuda(cudaStreamCreate(&stream), "StreamHelper create");
+		}
+
+		return true;
+	}
+
+	~CachedStream() {
+		if (stream)
+			cudaStreamDestroy(stream);
+	}
+};
+
+inline thread_local CachedStream g_cachedStream;
+
+
 // Helper class for functions taking a std::optional<cudaStream_t> argument.
-// If a stream isn't passed to us, create a new stream and destroy that in our destructor.
+// If a stream isn't passed to us, use a per-thread cached stream and
+// synchronize it at the end of the call.
 class StreamHelper {
 public:
 	StreamHelper(std::optional<cudaStream_t> _stream) {
+		ok = true;
 		if (_stream) {
-			ok = true;
-			ownsStream = false;
+			syncOnExit = false;
 			stream = _stream.value();
 		} else {
-			ok = true;
-			ownsStream = true;
-			stream = 0;
-			ok &= checkCuda(cudaStreamCreate(&stream), "StreamHelper create");
+			syncOnExit = true;
+			ok &= g_cachedStream.ensure();
+			stream = g_cachedStream.stream;
 		}
 	}
-	~StreamHelper() {
-		if (ownsStream)
-			cudaStreamDestroy(stream);
-	}
+	~StreamHelper() = default;
 
 	cudaStream_t operator()() const { return stream; }
 
@@ -106,7 +138,7 @@ public:
 
 	// Sync on stream if not using an existing stream
 	bool syncIfSync(const char *msg) {
-		if (ownsStream)
+		if (syncOnExit)
 			return sync(msg);
 		else
 			return ok;
@@ -117,7 +149,7 @@ public:
 	}
 private:
 	bool ok;
-	bool ownsStream;
+	bool syncOnExit;
 	cudaStream_t stream;
 };
 

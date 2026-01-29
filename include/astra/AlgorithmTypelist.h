@@ -47,6 +47,7 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 #include "CudaCglsAlgorithm3D.h"
 #include "CudaSirtAlgorithm3D.h"
 #include "CudaSirtAlgorithm3DBatch.h"
+#include "CudaSirtAlgorithm3DGpuBatch.h"
 #include "CudaForwardProjectionAlgorithm3D.h"
 #include "CudaForwardProjectionAlgorithm3DBatch.h"
 #include "CudaBackProjectionAlgorithm3D.h"
@@ -80,6 +81,7 @@ typedef TypeList<
 			CCudaFDKAlgorithm3D,
 			CCudaSirtAlgorithm3D,
 			CCudaSirtAlgorithm3DBatch,
+			CCudaSirtAlgorithm3DGpuBatch,
 			CCudaForwardProjectionAlgorithm3D,
 			CCudaForwardProjectionAlgorithm3DBatch,
 			CCudaBackProjectionAlgorithm3D,

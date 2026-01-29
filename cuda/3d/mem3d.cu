@@ -370,6 +370,20 @@ _AstraExport MemHandle3D wrapHandle(float *D_ptr, unsigned int x, unsigned int y
 	return hnd;
 }
 
+_AstraExport bool getPitchedPtrInfo(const MemHandle3D& handle, MemPitchedPtrInfo3D& out)
+{
+	if (!handle.d)
+		return false;
+	if (handle.d->arr)
+		return false;
+
+	out.ptr = handle.d->ptr.ptr;
+	out.pitch = handle.d->ptr.pitch;
+	out.xsize = handle.d->ptr.xsize;
+	out.ysize = handle.d->ptr.ysize;
+	return true;
+}
+
 MemHandle3D createProjectionArrayHandle(const float *ptr, unsigned int x, unsigned int y, unsigned int z)
 {
 	SDimensions3D dims;
