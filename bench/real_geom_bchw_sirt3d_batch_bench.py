@@ -2,11 +2,9 @@
 
 import argparse
 import json
-import statistics
 import time
 from math import cos, pi, sin
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -16,406 +14,259 @@ try:
     import torch
 except Exception as e:  # pragma: no cover
     raise RuntimeError("This benchmark requires PyTorch (torch).") from e
+try:
+    from PIL import Image
+except Exception as e:  # pragma: no cover
+    raise RuntimeError("This benchmark requires Pillow (PIL).") from e
 
 
 N_SEGMENTS = 3
 DEG_TO_RAD = pi / 180.0
 
 
-def _median(xs: List[float]) -> float:
-    return statistics.median(xs) if xs else float("nan")
+def fov_3d_from_config(cfg: dict, n_slices: int | None) -> tuple[int, int, int, float, float, float, float, float, float]:
+    fov = cfg["imaging"]["fov"]
+    w = int(fov["width"] * fov.get("pixel_ratio", 1))
+    h = int(fov["height"] * fov.get("pixel_ratio", 1))
+    px = float(fov["pixel_size"])
+    cx = float(fov.get("center_offset_x", 0.0))
+    cy = float(fov.get("center_offset_y", 0.0))
+    vz = float(fov.get("voxel_z", px))
+
+    z = int(n_slices if n_slices is not None else fov.get("n_slices", 1))
+
+    min_x = cx - (w * px) / 2.0
+    max_x = cx + (w * px) / 2.0
+    min_y = cy - (h * px) / 2.0
+    max_y = cy + (h * px) / 2.0
+    min_z = -(z * vz) / 2.0
+    max_z = +(z * vz) / 2.0
+    return h, w, z, min_x, max_x, min_y, max_y, min_z, max_z
 
 
-def calculate_fov_bounds(
-    width_pixels: int,
-    height_pixels: int,
-    pixel_size: float,
-    center_offset_x: float = 0.0,
-    center_offset_y: float = 0.0,
-) -> Tuple[float, float, float, float]:
-    fov_width_mm = width_pixels * pixel_size
-    fov_height_mm = height_pixels * pixel_size
-    min_x = center_offset_x - fov_width_mm / 2
-    max_x = center_offset_x + fov_width_mm / 2
-    min_y = center_offset_y - fov_height_mm / 2
-    max_y = center_offset_y + fov_height_mm / 2
-    return min_x, max_x, min_y, max_y
+def make_cone_vec_geometry(cfg: dict) -> tuple[dict, int, int, int]:
+    geo = cfg["geometry"]
+    src = geo["source"]
+    det = geo["detector"]
+
+    num_sources = int(src["num_sources"])
+    source_interval = float(src["source_interval"])
+    active = list(src["active_source_indices"])
+    source_to_phantom = float(src["source_to_phantom"])
+
+    detector_size = float(det["detector_size"])
+    detector_interval = float(det["detector_interval"])
+    source_to_detector = float(det["source_to_detector"])
+    detector_angle = float(det["angle"])
+    segment_gap = float(det["segment_gap"])
+
+    det_height = float(det.get("detector_height", 0.0))
+    det_rows = int(det.get("detector_row_count", 1))
+    det_cols = int(det["num_bins"])
+
+    arr_len = source_interval * (num_sources - 1)
+    phantom_to_detector = source_to_detector - source_to_phantom
+
+    a = detector_angle * DEG_TO_RAD
+    ca = cos(a)
+    sa = sin(a)
+
+    det_row_interval = det_height / det_rows if det_rows > 0 else 0.0
+    vX, vY, vZ = 0.0, 0.0, float(det_row_interval)
+
+    dX_lr = phantom_to_detector - (detector_size / 2.0) * sa - segment_gap * sa
+
+    vectors = np.empty((len(active) * N_SEGMENTS, 12), dtype=np.float32)
+    k = 0
+    for i in active:
+        srcX = -source_to_phantom
+        srcY = source_interval * i - (arr_len / 2.0)
+        srcZ = 0.0
+        dZ = 0.0
+
+        dY_left = -(detector_size / 2.0) * (1.0 + ca) - segment_gap * ca
+        uX_left = detector_interval * sa
+        uY_left = detector_interval * ca
+        vectors[k] = [srcX, srcY, srcZ, dX_lr, dY_left, dZ, uX_left, uY_left, 0.0, vX, vY, vZ]
+        k += 1
+
+        vectors[k] = [
+            srcX,
+            srcY,
+            srcZ,
+            phantom_to_detector,
+            0.0,
+            dZ,
+            0.0,
+            detector_interval,
+            0.0,
+            vX,
+            vY,
+            vZ,
+        ]
+        k += 1
+
+        dY_right = (detector_size / 2.0) * (1.0 + ca) + segment_gap * ca
+        uX_right = -detector_interval * sa
+        uY_right = detector_interval * ca
+        vectors[k] = [srcX, srcY, srcZ, dX_lr, dY_right, dZ, uX_right, uY_right, 0.0, vX, vY, vZ]
+        k += 1
+
+    proj_geom = astra.create_proj_geom("cone_vec", det_rows, det_cols, vectors)
+    total_angles = int(vectors.shape[0])
+    n_sources_active = total_angles // N_SEGMENTS
+    return proj_geom, det_rows, det_cols, n_sources_active
 
 
-def calculate_fov_bounds_3d(
-    width_pixels: int,
-    height_pixels: int,
-    n_slices: int,
-    pixel_size: float,
-    voxel_z: float,
-    center_offset_x: float = 0.0,
-    center_offset_y: float = 0.0,
-) -> Tuple[float, float, float, float, float, float]:
-    min_x, max_x, min_y, max_y = calculate_fov_bounds(
-        width_pixels, height_pixels, pixel_size, center_offset_x, center_offset_y
-    )
-    vol_z_size = n_slices * voxel_z
-    min_z = -vol_z_size / 2
-    max_z = vol_z_size / 2
-    return min_x, max_x, min_y, max_y, min_z, max_z
+def sino_bchw_to_astra_view(sino_bchw: torch.Tensor, det_cols: int) -> torch.Tensor:
+    # BCHW: (B, det_rows, n_sources, det_cols*3) -> (B, det_rows, n_sources*3, det_cols)
+    b, det_rows, n_sources, _ = sino_bchw.shape
+    return sino_bchw.view(b, det_rows, n_sources, N_SEGMENTS, det_cols).reshape(b, det_rows, n_sources * N_SEGMENTS, det_cols)
 
 
-def get_fov_3d(
-    config: Dict[str, Any], n_slices: int | None = None
-) -> Tuple[int, int, int, float, float, float, float, float, float]:
-    fov = config["imaging"]["fov"]
+def make_gpu_links_batched_3d(t: torch.Tensor, dims_xyz: tuple[int, int, int]) -> list:
+    # Link each batch item by pointer offset; requires contiguous BCHW.
+    if t.dtype != torch.float32 or (not t.is_cuda) or (not t.is_contiguous()) or t.ndim != 4:
+        raise ValueError("expected contiguous CUDA float32 tensor with 4 dims (B, Z, Y, X)")
 
-    width_pixels = int(fov["width"] * fov["pixel_ratio"])
-    height_pixels = int(fov["height"] * fov["pixel_ratio"])
-    pixel_size = float(fov["pixel_size"])
-    center_offset_x = float(fov.get("center_offset_x", 0))
-    center_offset_y = float(fov.get("center_offset_y", 0))
-    voxel_z = float(fov.get("voxel_z", pixel_size))
+    b = int(t.shape[0])
+    x, y, z = (int(v) for v in dims_xyz)
 
-    if n_slices is None:
-        n_slices = int(fov.get("n_slices", 1))
-    else:
-        n_slices = int(n_slices)
-
-    bounds = calculate_fov_bounds_3d(
-        width_pixels,
-        height_pixels,
-        n_slices,
-        pixel_size,
-        voxel_z,
-        center_offset_x,
-        center_offset_y,
-    )
-    return (
-        height_pixels,
-        width_pixels,
-        n_slices,
-        bounds[0],
-        bounds[1],
-        bounds[2],
-        bounds[3],
-        bounds[4],
-        bounds[5],
-    )
-
-
-class ProjectionVectorGenerator:
-    """
-    Copy of /home/suxh/code/pycode/astra/astra_2d/astra_package/ct/geometry/vectors.py
-    (3D cone_vec generator).
-    """
-
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self._parse_config()
-
-    def _parse_config(self) -> None:
-        geo = self.config["geometry"]
-        source = geo["source"]
-        detector = geo["detector"]
-
-        self.num_sources = int(source["num_sources"])
-        self.source_interval = float(source["source_interval"])
-        self.active_source_indices: List[int] = list(source["active_source_indices"])
-        self.source_to_phantom = float(source["source_to_phantom"])
-
-        self.detector_size = float(detector["detector_size"])
-        self.detector_interval = float(detector["detector_interval"])
-        self.source_to_detector = float(detector["source_to_detector"])
-        self.detector_angle = float(detector["angle"])
-        self.segment_gap = float(detector["segment_gap"])
-
-        self.detector_height = float(detector.get("detector_height", 0))
-        self.detector_row_count = int(detector.get("detector_row_count", 1))
-
-        self.arr_len = self.source_interval * (self.num_sources - 1)
-        self.phantom_to_detector = self.source_to_detector - self.source_to_phantom
-
-    def generate_3d(self) -> np.ndarray:
-        vectors: list[list[float]] = []
-
-        angle = self.detector_angle * DEG_TO_RAD
-        gap = self.segment_gap
-
-        cos_angle = cos(angle)
-        sin_angle = sin(angle)
-
-        det_row_interval = self.detector_height / self.detector_row_count
-        vX, vY, vZ = 0.0, 0.0, float(det_row_interval)
-
-        dX_lr = (
-            self.phantom_to_detector
-            - (self.detector_size / 2) * sin_angle
-            - gap * sin_angle
-        )
-
-        for i in self.active_source_indices:
-            srcX = -self.source_to_phantom
-            srcY = self.source_interval * i - (self.arr_len / 2)
-            srcZ = 0.0
-            dZ = 0.0
-
-            # left segment
-            dY_left = -(self.detector_size / 2) * (1 + cos_angle) - gap * cos_angle
-            uX_left = self.detector_interval * sin_angle
-            uY_left = self.detector_interval * cos_angle
-            vectors.append(
-                [
-                    srcX,
-                    srcY,
-                    srcZ,
-                    dX_lr,
-                    dY_left,
-                    dZ,
-                    uX_left,
-                    uY_left,
-                    0.0,
-                    vX,
-                    vY,
-                    vZ,
-                ]
-            )
-
-            # middle segment
-            vectors.append(
-                [
-                    srcX,
-                    srcY,
-                    srcZ,
-                    self.phantom_to_detector,
-                    0.0,
-                    dZ,
-                    0.0,
-                    self.detector_interval,
-                    0.0,
-                    vX,
-                    vY,
-                    vZ,
-                ]
-            )
-
-            # right segment
-            dY_right = (self.detector_size / 2) * (1 + cos_angle) + gap * cos_angle
-            uX_right = -self.detector_interval * sin_angle
-            uY_right = self.detector_interval * cos_angle
-            vectors.append(
-                [
-                    srcX,
-                    srcY,
-                    srcZ,
-                    dX_lr,
-                    dY_right,
-                    dZ,
-                    uX_right,
-                    uY_right,
-                    0.0,
-                    vX,
-                    vY,
-                    vZ,
-                ]
-            )
-
-        return np.asarray(vectors, dtype=np.float32)
-
-
-def _sino_bchw_to_astra_view(sino_bchw: torch.Tensor, det_cols: int) -> torch.Tensor:
-    # BCHW where C=det_rows, H=n_sources, W=det_cols*N_SEGMENTS
-    if sino_bchw.ndim != 4:
-        raise ValueError(f"sino must be BCHW (4D), got shape={tuple(sino_bchw.shape)}")
-    if sino_bchw.shape[-1] != det_cols * N_SEGMENTS:
-        raise ValueError(
-            f"sino last dim must be det_cols*{N_SEGMENTS}={det_cols*N_SEGMENTS}, got {sino_bchw.shape[-1]}"
-        )
-    B, det_rows, n_sources, _ = sino_bchw.shape
-    return sino_bchw.view(B, det_rows, n_sources, N_SEGMENTS, det_cols).reshape(
-        B, det_rows, n_sources * N_SEGMENTS, det_cols
-    )
-
-
-def _make_gpu_links_for_batched_3d(
-    tensor_bxyz: torch.Tensor,
-    dims_xyz: Tuple[int, int, int],
-) -> List[astra.data3d.GPULink]:
-    if tensor_bxyz.dtype != torch.float32:
-        raise ValueError(f"expected float32 tensor, got {tensor_bxyz.dtype}")
-    if not tensor_bxyz.is_cuda:
-        raise ValueError("expected CUDA tensor")
-    if not tensor_bxyz.is_contiguous():
-        raise ValueError("expected contiguous tensor")
-    if tensor_bxyz.ndim != 4:
-        raise ValueError(f"expected 4D batched tensor, got shape={tuple(tensor_bxyz.shape)}")
-
-    B = int(tensor_bxyz.shape[0])
-    x, y, z = (int(d) for d in dims_xyz)
-
-    # We use the slice-by-offset approach to keep a single underlying allocation.
-    base_ptr = int(tensor_bxyz.data_ptr())
-    stride0_elems = int(tensor_bxyz.stride(0))
-    elem_size = int(tensor_bxyz.element_size())
+    base_ptr = int(t.data_ptr())
+    stride0_elems = int(t.stride(0))
+    elem_size = int(t.element_size())
     pitch_bytes = x * elem_size
 
-    links: list[astra.data3d.GPULink] = []
-    for b in range(B):
-        ptr = base_ptr + b * stride0_elems * elem_size
+    links = []
+    for bi in range(b):
+        ptr = base_ptr + bi * stride0_elems * elem_size
         links.append(astra.data3d.GPULink(ptr, x, y, z, pitch_bytes))
     return links
 
 
+def to_uint8(img: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
+    x = np.asarray(img, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    lo = float(np.percentile(x, p_low))
+    hi = float(np.percentile(x, p_high))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.min(x)), float(np.max(x))
+        if hi <= lo:
+            return np.zeros_like(x, dtype=np.uint8)
+    y = (x - lo) / (hi - lo + 1e-12)
+    y = np.clip(y, 0.0, 1.0)
+    return (y * 255.0 + 0.5).astype(np.uint8)
+
+
+def save_png(path: Path, img2d: np.ndarray, p_low: float, p_high: float) -> None:
+    Image.fromarray(to_uint8(img2d, p_low=p_low, p_high=p_high), mode="L").save(path)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--config",
-        default="/home/suxh/code/pycode/astra/astra_2d/astra_package/ct/resources/config/config_119.json",
-        help="Path to astra_2d JSON config (3D cone_vec geometry).",
-    )
+    p.add_argument("--config", default="/home/suxh/code/pycode/astra/astra_2d/astra_package/ct/resources/config/config_119.json")
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--n-slices", type=int, default=None)
-    p.add_argument(
-        "--bubble-dir",
-        default=None,
-        help="Optional dir of 512x512 .npy images (e.g. ./bubble). If set, volumes are loaded from here.",
-    )
-    p.add_argument(
-        "--bubble-offset",
-        type=int,
-        default=0,
-        help="Start index into sorted .npy files when using --bubble-dir.",
-    )
+    p.add_argument("--batch", type=int, default=12)
+    p.add_argument("--n-slices", type=int, default=1)
+
+    p.add_argument("--bubble-dir", default="bubble", help="Dir of 512x512 .npy images. Set to '' to use random.")
+    p.add_argument("--bubble-offset", type=int, default=0)
+
     p.add_argument("--sirt-iters", type=int, default=10)
     p.add_argument("--relax", type=float, default=1.0)
-    p.add_argument("--fp-repeats", type=int, default=10)
-    p.add_argument("--repeats", type=int, default=5)
-    p.add_argument("--workers", type=int, default=4, help="SIRT3D_CUDA_GPU_BATCH NumWorkers")
-    p.add_argument("--verify", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+
+    p.add_argument("--fp-repeats", type=int, default=1)
+    p.add_argument("--repeats", type=int, default=1)
+
+    p.add_argument("--viz-dir", default=None, help="If set, save PNGs here.")
+    p.add_argument("--viz-n", type=int, default=4)
+    p.add_argument("--viz-p-low", type=float, default=1.0)
+    p.add_argument("--viz-p-high", type=float, default=99.0)
+
     args = p.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    cfg = json.load(open(args.config, "r", encoding="utf-8"))
 
     if not astra.use_cuda():
-        raise RuntimeError("ASTRA reports CUDA is not available. (Try running with GPU access.)")
+        raise RuntimeError("ASTRA reports CUDA is not available. (Run with GPU access.)")
 
     torch.cuda.set_device(args.gpu)
     astra.set_gpu_index(args.gpu)
     print("Device:", astra.get_gpu_info(args.gpu))
 
-    # --- Geometry (match astra_2d) ---
-    height, width, n_slices, min_x, max_x, min_y, max_y, min_z, max_z = get_fov_3d(
-        config, n_slices=args.n_slices
-    )
-    vol_geom = astra.create_vol_geom(
-        height, width, n_slices, min_x, max_x, min_y, max_y, min_z, max_z
-    )
+    h, w, z, min_x, max_x, min_y, max_y, min_z, max_z = fov_3d_from_config(cfg, args.n_slices)
+    vol_geom = astra.create_vol_geom(h, w, z, min_x, max_x, min_y, max_y, min_z, max_z)
+    proj_geom, det_rows, det_cols, n_sources = make_cone_vec_geometry(cfg)
 
-    generator = ProjectionVectorGenerator(config)
-    proj_vectors = generator.generate_3d()
-    det_cols = int(config["geometry"]["detector"]["num_bins"])
-    det_rows = int(config["geometry"]["detector"]["detector_row_count"])
-    proj_geom = astra.create_proj_geom("cone_vec", det_rows, det_cols, proj_vectors)
+    b = int(args.batch)
+    print(f"vol[B,Z,H,W]=[{b},{z},{h},{w}]  sino[B,det_rows,n_sources,det_cols*3]=[{b},{det_rows},{n_sources},{det_cols*N_SEGMENTS}]")
 
-    # Total angles in ASTRA layout includes the 3 detector segments per source.
-    total_angles = int(proj_vectors.shape[0])
-    if total_angles % N_SEGMENTS != 0:
-        raise RuntimeError(f"expected vectors multiple of {N_SEGMENTS}, got {total_angles}")
-    n_sources = total_angles // N_SEGMENTS
-
-    print(
-        f"Shapes: vol[B,C,H,W]=[{args.batch},{n_slices},{height},{width}]  "
-        f"sino[B,C,H,W]=[{args.batch},{det_rows},{n_sources},{det_cols*N_SEGMENTS}]"
-    )
-
-    # --- Allocate batched tensors in BCHW ---
-    B = int(args.batch)
+    # --- volumes (B, Z, H, W) ---
     if args.bubble_dir:
         bubble_dir = Path(args.bubble_dir)
         files = sorted(bubble_dir.glob("*.npy"))
-        if not files:
-            raise RuntimeError(f"--bubble-dir has no .npy files: {bubble_dir}")
-
-        start = int(args.bubble_offset)
-        end = start + B
-        if end > len(files):
-            raise RuntimeError(
-                f"Need {B} files starting at offset {start}, but only {len(files)} found in {bubble_dir}"
-            )
-
-        vols_cpu = []
-        for fpath in files[start:end]:
-            arr = np.load(fpath)
-            if arr.shape != (height, width):
-                raise RuntimeError(f"{fpath} has shape {arr.shape}, expected {(height, width)}")
-            if arr.dtype != np.float32:
-                arr = arr.astype(np.float32, copy=False)
-            vols_cpu.append(arr)
-        vols_np = np.stack(vols_cpu, axis=0)  # (B, H, W)
-        vols_np = vols_np[:, None, :, :]  # (B, 1, H, W)
-        if vols_np.shape[1] != n_slices:
-            raise RuntimeError(
-                f"Loaded bubble volumes have n_slices=1, but vol_geom expects n_slices={n_slices} "
-                f"(set --n-slices 1)."
-            )
-        vols_bchw = torch.from_numpy(vols_np).contiguous().to(device="cuda", non_blocking=False)
+        if len(files) < args.bubble_offset + b:
+            raise RuntimeError(f"Need {b} .npy files from offset {args.bubble_offset}, but only {len(files)} in {bubble_dir}")
+        imgs = []
+        for fpath in files[args.bubble_offset : args.bubble_offset + b]:
+            a = np.load(fpath)
+            if a.shape != (h, w):
+                raise RuntimeError(f"{fpath} has shape {a.shape}, expected {(h, w)}")
+            imgs.append(a.astype(np.float32, copy=False))
+        vols_np = np.stack(imgs, axis=0)[:, None, :, :]  # (B,1,H,W)
+        if z != 1:
+            raise RuntimeError("bubble inputs are 2D; set --n-slices 1")
+        vols_bzhw = torch.from_numpy(vols_np).contiguous().to(device="cuda")
     else:
-        vols_bchw = torch.randn((B, n_slices, height, width), device="cuda", dtype=torch.float32)
+        vols_bzhw = torch.rand((b, z, h, w), device="cuda", dtype=torch.float32)
 
-    # Projections are "C=det_rows, H=n_sources, W=det_cols*3" for deep learning (BCHW).
-    sino_bchw = torch.empty((B, det_rows, n_sources, det_cols * N_SEGMENTS), device="cuda", dtype=torch.float32)
-    sino_bchw.zero_()
+    # --- sinogram BCHW for DL: (B, det_rows, n_sources, det_cols*3) ---
+    sino_bchw = torch.zeros((b, det_rows, n_sources, det_cols * N_SEGMENTS), device="cuda", dtype=torch.float32)
+    sino_astra = sino_bchw_to_astra_view(sino_bchw, det_cols)  # (B, det_rows, angles, det_cols)
+    recons_bzhw = torch.zeros((b, z, h, w), device="cuda", dtype=torch.float32)
 
-    # Internal ASTRA view: (B, det_rows, total_angles, det_cols)
-    sino_astra = _sino_bchw_to_astra_view(sino_bchw, det_cols)
-    assert sino_astra.is_contiguous()
-
-    recons_bchw = torch.zeros((B, n_slices, height, width), device="cuda", dtype=torch.float32)
-
-    # --- Link batched tensors via GPULink (zero-copy) ---
-    # ASTRA expects 3D arrays, so we link one 3D GPULink per batch item.
-    vol_links = _make_gpu_links_for_batched_3d(vols_bchw, (width, height, n_slices))
-    recon_links = _make_gpu_links_for_batched_3d(recons_bchw, (width, height, n_slices))
-    sino_links = _make_gpu_links_for_batched_3d(sino_astra, (det_cols, total_angles, det_rows))
+    # --- link tensors as 3D GPULink ---
+    vol_links = make_gpu_links_batched_3d(vols_bzhw, (w, h, z))
+    recon_links = make_gpu_links_batched_3d(recons_bzhw, (w, h, z))
+    sino_links = make_gpu_links_batched_3d(sino_astra, (det_cols, n_sources * N_SEGMENTS, det_rows))
 
     vol_ids = [astra.data3d.link("-vol", vol_geom, lnk) for lnk in vol_links]
     recon_ids = [astra.data3d.link("-vol", vol_geom, lnk) for lnk in recon_links]
     sino_ids = [astra.data3d.link("-sino", proj_geom, lnk) for lnk in sino_links]
 
     try:
-        # --- FP (GPU batch) ---
+        # --- FP ---
         fp_cfg = astra.astra_dict("FP3D_CUDA_BATCH")
         fp_cfg["VolumeDataIds"] = vol_ids
         fp_cfg["ProjectionDataIds"] = sino_ids
         fp_id = astra.algorithm.create(fp_cfg)
-        # Warmup + timing for FP
-        astra.algorithm.run(fp_id)
+        astra.algorithm.run(fp_id)  # warmup
         torch.cuda.synchronize()
-        fp_times: list[float] = []
+        fp_times = []
         for _ in range(int(args.fp_repeats)):
             t0 = time.perf_counter()
             astra.algorithm.run(fp_id)
             torch.cuda.synchronize()
             fp_times.append(time.perf_counter() - t0)
         astra.algorithm.delete(fp_id)
-        fp_med = _median(fp_times)
-        print(
-            f"GPU FP3D_CUDA_BATCH: median total={fp_med:.6f}s  per-sample={fp_med/B:.6f}s"
-        )
+        if fp_times:
+            fp_med = float(np.median(fp_times))
+            print(f"FP3D_CUDA_BATCH: median total={fp_med:.6f}s  per-sample={fp_med/b:.6f}s")
 
-        # --- SIRT (GPU batch, GPU-linked, multi-worker) ---
+        # --- SIRT ---
         sirt_cfg = astra.astra_dict("SIRT3D_CUDA_GPU_BATCH")
         sirt_cfg["ProjectionDataIds"] = sino_ids
         sirt_cfg["ReconstructionDataIds"] = recon_ids
         sirt_cfg["options"] = {"Relaxation": float(args.relax), "NumWorkers": int(args.workers)}
         sirt_id = astra.algorithm.create(sirt_cfg)
 
-        # Warmup
-        astra.algorithm.run(sirt_id, 1)
-        torch.cuda.synchronize()
-        recons_bchw.zero_()
+        astra.algorithm.run(sirt_id, 1)  # warmup
         torch.cuda.synchronize()
 
-        run_times: list[float] = []
+        run_times = []
         for _ in range(int(args.repeats)):
-            recons_bchw.zero_()
+            recons_bzhw.zero_()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             astra.algorithm.run(sirt_id, int(args.sirt_iters))
@@ -424,36 +275,32 @@ def main() -> int:
 
         astra.algorithm.delete(sirt_id)
 
-        med = _median(run_times)
-        print(
-            f"GPU SIRT3D_CUDA_GPU_BATCH: median total={med:.6f}s  per-sample={med/B:.6f}s  "
-            f"per-iter-per-sample={(med/(B*int(args.sirt_iters))):.6f}s"
-        )
+        if run_times:
+            med = float(np.median(run_times))
+            print(
+                f"SIRT3D_CUDA_GPU_BATCH: median total={med:.6f}s  per-sample={med/b:.6f}s  "
+                f"per-iter-per-sample={(med/(b*int(args.sirt_iters))):.6f}s"
+            )
 
-        if args.verify:
-            # CPU batch reference (copies sino to host, runs SIRT3D_CUDA_BATCH, compares recons).
-            sino_h = sino_astra.detach().cpu().numpy()
-            recons_gpu_h = recons_bchw.detach().cpu().numpy()
+        # --- visualize (save PNGs) ---
+        if args.viz_dir:
+            out_dir = Path(args.viz_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            n_save = min(b, int(args.viz_n))
 
-            # Run CPU batch SIRT on host arrays.
-            sino_ids_cpu = [astra.data3d.link("-sino", proj_geom, sino_h[b]) for b in range(B)]
-            recons_cpu = np.zeros((B, n_slices, height, width), dtype=np.float32)
-            recon_ids_cpu = [astra.data3d.link("-vol", vol_geom, recons_cpu[b]) for b in range(B)]
-            try:
-                cpu_cfg = astra.astra_dict("SIRT3D_CUDA_BATCH")
-                cpu_cfg["ProjectionDataIds"] = sino_ids_cpu
-                cpu_cfg["ReconstructionDataIds"] = recon_ids_cpu
-                cpu_cfg["options"] = {"Relaxation": float(args.relax)}
-                cpu_id = astra.algorithm.create(cpu_cfg)
-                astra.algorithm.run(cpu_id, int(args.sirt_iters))
-                astra.algorithm.delete(cpu_id)
+            # z==1 for your training case; keep generic: visualize mid-slice.
+            z_idx = z // 2
+            vols_2d = vols_bzhw[:, z_idx].detach().cpu().numpy()
+            recons_2d = recons_bzhw[:, z_idx].detach().cpu().numpy()
 
-                max_abs = float(np.max(np.abs(recons_cpu - recons_gpu_h)))
-                denom = float(np.linalg.norm(recons_cpu) + 1e-12)
-                rel = float(np.linalg.norm(recons_cpu - recons_gpu_h) / denom)
-                print(f"[verify] max abs diff: {max_abs:.6g}, rel l2 diff: {rel:.6g}")
-            finally:
-                astra.data3d.delete(sino_ids_cpu + recon_ids_cpu)
+            for bi in range(n_save):
+                vol = vols_2d[bi]
+                recon = recons_2d[bi]
+                diff = np.abs(recon - vol)
+                save_png(out_dir / f"vol_b{bi:03d}.png", vol, args.viz_p_low, args.viz_p_high)
+                save_png(out_dir / f"recon_b{bi:03d}.png", recon, args.viz_p_low, args.viz_p_high)
+                save_png(out_dir / f"diff_b{bi:03d}.png", diff, 0.0, 99.5)
+            print(f"Saved {n_save} visualizations to: {out_dir}")
 
         return 0
     finally:
@@ -462,3 +309,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

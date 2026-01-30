@@ -8,6 +8,7 @@
 __pycache__
 .vscode/*
 bubble/
+bench/
 
 # Cython-generated files
 /python/astra/*.cpp
