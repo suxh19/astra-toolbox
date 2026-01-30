@@ -5,6 +5,7 @@ import json
 import statistics
 import time
 from math import cos, pi, sin
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -270,6 +271,17 @@ def main() -> int:
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--n-slices", type=int, default=None)
+    p.add_argument(
+        "--bubble-dir",
+        default=None,
+        help="Optional dir of 512x512 .npy images (e.g. ./bubble). If set, volumes are loaded from here.",
+    )
+    p.add_argument(
+        "--bubble-offset",
+        type=int,
+        default=0,
+        help="Start index into sorted .npy files when using --bubble-dir.",
+    )
     p.add_argument("--sirt-iters", type=int, default=10)
     p.add_argument("--relax", type=float, default=1.0)
     p.add_argument("--fp-repeats", type=int, default=10)
@@ -315,7 +327,37 @@ def main() -> int:
 
     # --- Allocate batched tensors in BCHW ---
     B = int(args.batch)
-    vols_bchw = torch.randn((B, n_slices, height, width), device="cuda", dtype=torch.float32)
+    if args.bubble_dir:
+        bubble_dir = Path(args.bubble_dir)
+        files = sorted(bubble_dir.glob("*.npy"))
+        if not files:
+            raise RuntimeError(f"--bubble-dir has no .npy files: {bubble_dir}")
+
+        start = int(args.bubble_offset)
+        end = start + B
+        if end > len(files):
+            raise RuntimeError(
+                f"Need {B} files starting at offset {start}, but only {len(files)} found in {bubble_dir}"
+            )
+
+        vols_cpu = []
+        for fpath in files[start:end]:
+            arr = np.load(fpath)
+            if arr.shape != (height, width):
+                raise RuntimeError(f"{fpath} has shape {arr.shape}, expected {(height, width)}")
+            if arr.dtype != np.float32:
+                arr = arr.astype(np.float32, copy=False)
+            vols_cpu.append(arr)
+        vols_np = np.stack(vols_cpu, axis=0)  # (B, H, W)
+        vols_np = vols_np[:, None, :, :]  # (B, 1, H, W)
+        if vols_np.shape[1] != n_slices:
+            raise RuntimeError(
+                f"Loaded bubble volumes have n_slices=1, but vol_geom expects n_slices={n_slices} "
+                f"(set --n-slices 1)."
+            )
+        vols_bchw = torch.from_numpy(vols_np).contiguous().to(device="cuda", non_blocking=False)
+    else:
+        vols_bchw = torch.randn((B, n_slices, height, width), device="cuda", dtype=torch.float32)
 
     # Projections are "C=det_rows, H=n_sources, W=det_cols*3" for deep learning (BCHW).
     sino_bchw = torch.empty((B, det_rows, n_sources, det_cols * N_SEGMENTS), device="cuda", dtype=torch.float32)
