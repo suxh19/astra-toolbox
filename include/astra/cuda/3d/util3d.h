@@ -45,14 +45,14 @@ using astraCUDA::StreamHelper;
 
 cudaPitchedPtr allocateVolumeData(const SDimensions3D& dims);
 cudaPitchedPtr allocateProjectionData(const SDimensions3D& dims);
-bool zeroVolumeData(cudaPitchedPtr& D_data, const SDimensions3D& dims);
-bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims);
+bool zeroVolumeData(cudaPitchedPtr& D_data, const SDimensions3D& dims, std::optional<cudaStream_t> _stream = {});
+bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims, std::optional<cudaStream_t> _stream = {});
 bool copyVolumeToDevice(const float* data, cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch = 0);
 bool copyProjectionsToDevice(const float* data, cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch = 0);
 bool copyVolumeFromDevice(float* data, const cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch = 0);
 bool copyProjectionsFromDevice(float* data, const cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch = 0);
-bool duplicateVolumeData(cudaPitchedPtr& D_dest, const cudaPitchedPtr& D_src, const SDimensions3D& dims); 
-bool duplicateProjectionData(cudaPitchedPtr& D_dest, const cudaPitchedPtr& D_src, const SDimensions3D& dims); 
+bool duplicateVolumeData(cudaPitchedPtr& D_dest, const cudaPitchedPtr& D_src, const SDimensions3D& dims, std::optional<cudaStream_t> _stream = {});
+bool duplicateProjectionData(cudaPitchedPtr& D_dest, const cudaPitchedPtr& D_src, const SDimensions3D& dims, std::optional<cudaStream_t> _stream = {});
 
 
 bool transferProjectionsToArray(cudaPitchedPtr D_projData, cudaArray* array, const SDimensions3D& dims, std::optional<cudaStream_t> _stream = {});

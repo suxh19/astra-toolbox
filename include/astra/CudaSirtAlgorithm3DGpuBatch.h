@@ -36,6 +36,7 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 
 #ifdef ASTRA_CUDA
 
+#include <memory>
 #include <vector>
 
 namespace astraCUDA3d {
@@ -70,8 +71,9 @@ protected:
 	std::vector<CFloat32ProjectionData3D*> m_pSinograms;
 	std::vector<CFloat32VolumeData3D*> m_pReconstructions;
 
-	astraCUDA3d::SIRT* m_pSirt;
+	std::vector<std::unique_ptr<astraCUDA3d::SIRT>> m_pSirtWorkers;
 	bool m_bSirtInit;
+	int m_iNumWorkers;
 
 	int m_iGPUIndex;
 	int m_iDetectorSuperSampling;

@@ -73,21 +73,39 @@ cudaPitchedPtr allocateProjectionData(const SDimensions3D& dims)
 }
 bool zeroVolumeData(cudaPitchedPtr& D_data, const SDimensions3D& dims)
 {
+	return zeroVolumeData(D_data, dims, {});
+}
+bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims)
+{
+	return zeroProjectionData(D_data, dims, {});
+}
+bool zeroVolumeData(cudaPitchedPtr& D_data, const SDimensions3D& dims, std::optional<cudaStream_t> _stream)
+{
+	StreamHelper stream(_stream);
+	if (!stream)
+		return false;
+
 	cudaExtent extentV;
 	extentV.width = dims.iVolX*sizeof(float);
 	extentV.height = dims.iVolY;
 	extentV.depth = dims.iVolZ;
 
-	return checkCuda(cudaMemset3D(D_data, 0, extentV), "zeroVolumeData 3D");
+	bool ok = checkCuda(cudaMemset3DAsync(D_data, 0, extentV, stream()), "zeroVolumeData 3D");
+	return stream.syncIfSync(__FUNCTION__) && ok;
 }
-bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims)
+bool zeroProjectionData(cudaPitchedPtr& D_data, const SDimensions3D& dims, std::optional<cudaStream_t> _stream)
 {
+	StreamHelper stream(_stream);
+	if (!stream)
+		return false;
+
 	cudaExtent extentP;
 	extentP.width = dims.iProjU*sizeof(float);
 	extentP.height = dims.iProjAngles;
 	extentP.depth = dims.iProjV;
 
-	return checkCuda(cudaMemset3D(D_data, 0, extentP), "zeroProjectionData 3D");
+	bool ok = checkCuda(cudaMemset3DAsync(D_data, 0, extentP, stream()), "zeroProjectionData 3D");
+	return stream.syncIfSync(__FUNCTION__) && ok;
 }
 bool copyVolumeToDevice(const float* data, cudaPitchedPtr& D_data, const SDimensions3D& dims, unsigned int pitch)
 {
@@ -215,6 +233,20 @@ bool copyProjectionsFromDevice(float* data, const cudaPitchedPtr& D_data, const 
 
 bool duplicateVolumeData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, const SDimensions3D& dims)
 {
+	return duplicateVolumeData(D_dst, D_src, dims, {});
+}
+
+bool duplicateProjectionData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, const SDimensions3D& dims)
+{
+	return duplicateProjectionData(D_dst, D_src, dims, {});
+}
+
+bool duplicateVolumeData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, const SDimensions3D& dims, std::optional<cudaStream_t> _stream)
+{
+	StreamHelper stream(_stream);
+	if (!stream)
+		return false;
+
 	cudaExtent extentV;
 	extentV.width = dims.iVolX*sizeof(float);
 	extentV.height = dims.iVolY;
@@ -222,7 +254,7 @@ bool duplicateVolumeData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, con
 
 	cudaPos zp = { 0, 0, 0 };
 
-	cudaMemcpy3DParms p;
+	cudaMemcpy3DParms p = {0};
 	p.srcArray = 0;
 	p.srcPos = zp;
 	p.srcPtr = D_src;
@@ -232,11 +264,16 @@ bool duplicateVolumeData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, con
 	p.extent = extentV;
 	p.kind = cudaMemcpyDeviceToDevice;
 
-	return checkCuda(cudaMemcpy3D(&p), "duplicateVolumeData 3D");
+	bool ok = checkCuda(cudaMemcpy3DAsync(&p, stream()), "duplicateVolumeData 3D");
+	return stream.syncIfSync(__FUNCTION__) && ok;
 }
 
-bool duplicateProjectionData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, const SDimensions3D& dims)
+bool duplicateProjectionData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src, const SDimensions3D& dims, std::optional<cudaStream_t> _stream)
 {
+	StreamHelper stream(_stream);
+	if (!stream)
+		return false;
+
 	cudaExtent extentV;
 	extentV.width = dims.iProjU*sizeof(float);
 	extentV.height = dims.iProjAngles;
@@ -244,7 +281,7 @@ bool duplicateProjectionData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src,
 
 	cudaPos zp = { 0, 0, 0 };
 
-	cudaMemcpy3DParms p;
+	cudaMemcpy3DParms p = {0};
 	p.srcArray = 0;
 	p.srcPos = zp;
 	p.srcPtr = D_src;
@@ -254,7 +291,8 @@ bool duplicateProjectionData(cudaPitchedPtr& D_dst, const cudaPitchedPtr& D_src,
 	p.extent = extentV;
 	p.kind = cudaMemcpyDeviceToDevice;
 
-	return checkCuda(cudaMemcpy3D(&p), "duplicateProjectionData 3D");
+	bool ok = checkCuda(cudaMemcpy3DAsync(&p, stream()), "duplicateProjectionData 3D");
+	return stream.syncIfSync(__FUNCTION__) && ok;
 }
 
 

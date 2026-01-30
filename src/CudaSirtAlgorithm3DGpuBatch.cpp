@@ -31,6 +31,9 @@ along with the ASTRA Toolbox. If not, see <http://www.gnu.org/licenses/>.
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
+#include <thread>
+
 #include "astra/AstraObjectManager.h"
 
 #include "astra/VolumeGeometry3D.h"
@@ -48,18 +51,16 @@ CCudaSirtAlgorithm3DGpuBatch::CCudaSirtAlgorithm3DGpuBatch()
 {
 	m_bIsInitialized = false;
 	m_pProjector = nullptr;
-	m_pSirt = nullptr;
 	m_bSirtInit = false;
 	m_iGPUIndex = -1;
 	m_iVoxelSuperSampling = 1;
 	m_iDetectorSuperSampling = 1;
 	m_fLambda = 1.0f;
+	m_iNumWorkers = 1;
 }
 
 CCudaSirtAlgorithm3DGpuBatch::~CCudaSirtAlgorithm3DGpuBatch()
 {
-	delete m_pSirt;
-	m_pSirt = nullptr;
 }
 
 void CCudaSirtAlgorithm3DGpuBatch::initializeFromProjector()
@@ -125,6 +126,7 @@ bool CCudaSirtAlgorithm3DGpuBatch::initialize(const Config& _cfg)
 	}
 
 	ok &= CR.getOptionNumerical("Relaxation", m_fLambda, 1.0f);
+	ok &= CR.getOptionInt("NumWorkers", m_iNumWorkers, 1);
 
 	initializeFromProjector();
 
@@ -138,9 +140,14 @@ bool CCudaSirtAlgorithm3DGpuBatch::initialize(const Config& _cfg)
 	if (!ok)
 		return false;
 
-	// Lazily initialize the GPU-side SIRT instance at first run()
-	delete m_pSirt;
-	m_pSirt = new astraCUDA3d::SIRT();
+	if (m_iNumWorkers < 1)
+		m_iNumWorkers = 1;
+
+	// Lazily initialize the GPU-side SIRT instances at first run()
+	m_pSirtWorkers.clear();
+	m_pSirtWorkers.reserve(m_iNumWorkers);
+	for (int i = 0; i < m_iNumWorkers; ++i)
+		m_pSirtWorkers.emplace_back(std::make_unique<astraCUDA3d::SIRT>());
 	m_bSirtInit = false;
 
 	m_bIsInitialized = check();
@@ -152,6 +159,7 @@ bool CCudaSirtAlgorithm3DGpuBatch::check()
 	ASTRA_CONFIG_CHECK(!m_pSinograms.empty(), "SIRT3D_CUDA_GPU_BATCH", "No Projection Data Objects specified.");
 	ASTRA_CONFIG_CHECK(m_pSinograms.size() == m_pReconstructions.size(), "SIRT3D_CUDA_GPU_BATCH",
 	                   "Number of Projection and Reconstruction Data Objects must match.");
+	ASTRA_CONFIG_CHECK(m_iNumWorkers >= 1, "SIRT3D_CUDA_GPU_BATCH", "NumWorkers must be a positive integer.");
 
 	ASTRA_CONFIG_CHECK(m_iVoxelSuperSampling >= 1, "SIRT3D_CUDA_GPU_BATCH", "VoxelSuperSampling must be a positive integer.");
 	ASTRA_CONFIG_CHECK(m_iDetectorSuperSampling >= 1, "SIRT3D_CUDA_GPU_BATCH", "DetectorSuperSampling must be a positive integer.");
@@ -200,7 +208,8 @@ bool CCudaSirtAlgorithm3DGpuBatch::check()
 bool CCudaSirtAlgorithm3DGpuBatch::run(int _iNrIterations)
 {
 	ASTRA_ASSERT(m_bIsInitialized);
-	ASTRA_CONFIG_CHECK(m_pSirt, "SIRT3D_CUDA_GPU_BATCH", "Internal error: SIRT instance not initialized.");
+	ASTRA_CONFIG_CHECK(!m_pSirtWorkers.empty(), "SIRT3D_CUDA_GPU_BATCH",
+	                   "Internal error: SIRT instances not initialized.");
 
 	const CProjectionGeometry3D& projgeom0 = m_pSinograms[0]->getGeometry();
 	const CVolumeGeometry3D& volgeom0 = m_pReconstructions[0]->getGeometry();
@@ -224,18 +233,23 @@ bool CCudaSirtAlgorithm3DGpuBatch::run(int _iNrIterations)
 		astra::Geometry3DParameters projs = astra::convertAstraGeometry(&volgeom0, &projgeom0, params.volScale);
 		ASTRA_CONFIG_CHECK(projs.isValid(), "SIRT3D_CUDA_GPU_BATCH", "Failed to convert geometry.");
 
-		ok &= m_pSirt->setGeometry(dims, projs, params);
-		ASTRA_CONFIG_CHECK(ok, "SIRT3D_CUDA_GPU_BATCH", "Failed to set SIRT geometry.");
-
-		m_pSirt->setRelaxation(m_fLambda);
-
-		ok &= m_pSirt->init();
-		ASTRA_CONFIG_CHECK(ok, "SIRT3D_CUDA_GPU_BATCH", "Failed to initialize SIRT.");
+		for (auto& sirt : m_pSirtWorkers) {
+			ok &= sirt->setGeometry(dims, projs, params);
+			ASTRA_CONFIG_CHECK(ok, "SIRT3D_CUDA_GPU_BATCH", "Failed to set SIRT geometry.");
+			sirt->setRelaxation(m_fLambda);
+			ok &= sirt->init();
+			ASTRA_CONFIG_CHECK(ok, "SIRT3D_CUDA_GPU_BATCH", "Failed to initialize SIRT.");
+		}
 
 		m_bSirtInit = true;
 	}
 
-	for (size_t i = 0; i < m_pSinograms.size(); ++i) {
+	const size_t n = m_pSinograms.size();
+	const size_t workers = std::min(n, static_cast<size_t>(std::max(1, m_iNumWorkers)));
+
+	std::atomic<bool> okAtomic{true};
+
+	auto run_one = [&](astraCUDA3d::SIRT& sirt, size_t i) {
 		CFloat32ProjectionData3D* sino = m_pSinograms[i];
 		CFloat32VolumeData3D* recon = m_pReconstructions[i];
 
@@ -246,9 +260,10 @@ bool CCudaSirtAlgorithm3DGpuBatch::run(int _iNrIterations)
 
 		astraCUDA3d::MemPitchedPtrInfo3D sinoInfo;
 		astraCUDA3d::MemPitchedPtrInfo3D volInfo;
-		ok &= astraCUDA3d::getPitchedPtrInfo(sinoStorage->getHandle(), sinoInfo);
-		ok &= astraCUDA3d::getPitchedPtrInfo(reconStorage->getHandle(), volInfo);
-		ASTRA_ASSERT(ok);
+		bool lok = true;
+		lok &= astraCUDA3d::getPitchedPtrInfo(sinoStorage->getHandle(), sinoInfo);
+		lok &= astraCUDA3d::getPitchedPtrInfo(reconStorage->getHandle(), volInfo);
+		ASTRA_ASSERT(lok);
 
 		cudaPitchedPtr D_sino;
 		D_sino.ptr = sinoInfo.ptr;
@@ -262,13 +277,47 @@ bool CCudaSirtAlgorithm3DGpuBatch::run(int _iNrIterations)
 		D_vol.xsize = volInfo.xsize;
 		D_vol.ysize = volInfo.ysize;
 
-		ok &= m_pSirt->setBuffers(D_vol, D_sino);
-		ASTRA_ASSERT(ok);
+		lok &= sirt.setBuffers(D_vol, D_sino);
+		ASTRA_ASSERT(lok);
+		lok &= sirt.iterate(_iNrIterations);
+		ASTRA_ASSERT(lok);
 
-		ok &= m_pSirt->iterate(_iNrIterations);
-		ASTRA_ASSERT(ok);
+		if (!lok)
+			okAtomic.store(false, std::memory_order_relaxed);
+	};
+
+	if (workers <= 1) {
+		for (size_t i = 0; i < n; ++i) {
+			run_one(*m_pSirtWorkers[0], i);
+			if (!okAtomic.load(std::memory_order_relaxed))
+				break;
+		}
+	} else {
+		std::vector<std::thread> threads;
+		threads.reserve(workers);
+
+		for (size_t t = 0; t < workers; ++t) {
+			threads.emplace_back([&, t]() {
+				// Each host thread needs to select the device before using CUDA.
+				if (!astraCUDA3d::setGPUIndex(m_iGPUIndex)) {
+					okAtomic.store(false, std::memory_order_relaxed);
+					return;
+				}
+
+				astraCUDA3d::SIRT& sirt = *m_pSirtWorkers[t];
+				for (size_t i = t; i < n; i += workers) {
+					if (!okAtomic.load(std::memory_order_relaxed))
+						break;
+					run_one(sirt, i);
+				}
+			});
+		}
+
+		for (auto& th : threads)
+			th.join();
 	}
 
+	ok &= okAtomic.load(std::memory_order_relaxed);
 	return ok;
 }
 

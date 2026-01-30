@@ -141,6 +141,7 @@ def main() -> int:
     p.add_argument("--relax", type=float, default=1.0)
     p.add_argument("--src-dist", type=float, default=1000.0)
     p.add_argument("--repeats", type=int, default=5)
+    p.add_argument("--workers", type=int, default=1, help="SIRT3D_CUDA_GPU_BATCH NumWorkers")
     p.add_argument("--verify", action="store_true")
     args = p.parse_args()
 
@@ -208,7 +209,7 @@ def main() -> int:
         sirt_cfg = astra.astra_dict("SIRT3D_CUDA_GPU_BATCH")
         sirt_cfg["ProjectionDataIds"] = sino_ids
         sirt_cfg["ReconstructionDataIds"] = recon_ids
-        sirt_cfg["options"] = {"Relaxation": float(args.relax)}
+        sirt_cfg["options"] = {"Relaxation": float(args.relax), "NumWorkers": int(args.workers)}
         sirt_id = astra.algorithm.create(sirt_cfg)
 
         # Warmup
